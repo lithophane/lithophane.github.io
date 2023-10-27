@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lithography Generator</title>
+    <link rel="icon" href="data:;base64,=" />
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/STLExporter.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.7/build/dat.gui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js "></script>
+    <style>
+      *,
+      .dg .c input[type="text"] {
+        margin: 0;
+      }
+
+      .dg {
+        font-size: 18px;
+      }
+
+      .dg li:not(.folder),
+      .dg.main .close-button {
+        height: 50px;
+        line-height: 50px;
+      }
+      .cr.function span {
+        width: 100%;
+      }
+
+      .dg .c input[type="text"],
+      .dg .c .slider {
+        height: 45px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <input type="file" id="imageInput" accept="image/*" style="display: none" />
+    <script type="module">
+      export class ImageParser {
+        constructor() {
+          this.canvas = document.createElement("canvas"); // Does not add to the dom
+          this.ctx = this.canvas.getContext("2d");
+          this.height = undefined;
+          this.width = undefined;
+        }
+
+        handleImage = (e, onComplete) => {
+          const reader = new FileReader();
+
+          reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+              this.canvas.width = img.width;
+              this.canvas.height = img.height;
+              this.ctx.drawImage(img, 0, 0, img.width, img.height);
+              this.height = img.height;
+              this.width = img.width;
+              onComplete && onComplete();
+            };
+            img.src = event.target.result;
+          };
+
+          reader.readAsDataURL(e.target.files[0]);
+        };
+
+        rawImage = () => {
+          return this.ctx.getImageData(0, 0, this.width, this.height).data;
+        };
+      }
+
+      // Easier to use this than to directly use `Float32Array`.
+      export class GeometryBuilder {
+        constructor(scaleXY = 1) {
+          this.scale = scaleXY;
+          this.vertices = [];
+        }
+        addQuad = (p1, p2, p3, p4) => {
+          const scale = this.scale;
+          this.vertices.push(p1.x * scale, p1.y * scale, p1.z);
+          this.vertices.push(p2.x * scale, p2.y * scale, p2.z);
+          this.vertices.push(p3.x * scale, p3.y * scale, p3.z);
+
+          this.vertices.push(p2.x * scale, p2.y * scale, p2.z);
+          this.vertices.push(p4.x * scale, p4.y * scale, p4.z); // Can't order 2, 3, 4 or normals are wrong.
+          this.vertices.push(p3.x * scale, p3.y * scale, p3.z);
+        };
+        addQuadFlat = (p1, p2, z) => {
+          this.addQuad(
+            { x: p1.x, y: p1.y, z },
+            { x: p1.x, y: p2.y, z },
+            { x: p2.x, y: p1.y, z },
+            { x: p2.x, y: p2.y, z }
+          );
+        };
+        addQuadHorizontal = (p1, p2, y) => {
+          this.addQuad(
+            { x: p1.x, y, z: p1.z },
+            { x: p1.x, y, z: p2.z },
+            { x: p2.x, y, z: p1.z },
+            { x: p2.x, y, z: p2.z }
+          );
+        };
+        addQuadVertical = (p1, p2, x) => {
+          this.addQuad(
+            { x, y: p1.y, z: p1.z },
+            { x, y: p1.y, z: p2.z },
+            { x, y: p2.y, z: p1.z },
+            { x, y: p2.y, z: p2.z }
+          );
+        };
+        translateX = (offset) => {
+          // Every second vertex is a y coordinate.
+          // `i % 3 === 0` will only return true if the vertex is x.
+          this.vertices = this.vertices.map((v, i) =>
+            i % 3 === 0 ? offset * this.scale + v : v
+          );
+        };
+        translateY = (offset) => {
+          // Every second vertex is a y coordinate.
+          // `i % 3 - 1 === 0` will only return true if the vertex is y.
+          this.vertices = this.vertices.map((v, i) =>
+            (i % 3) - 1 === 0 ? offset * this.scale + v : v
+          );
+        };
+        // Convert to format threejs understands.
+        nativeVertices = () => new Float32Array(this.vertices);
+      }
+
+      /////////////////////////////
+      ////////// GLOBALS //////////
+      /////////////////////////////
+      const imageInput = document.getElementById("imageInput");
+      const guiParams = {
+        resolution: 1,
+        firstLayerHeight: 0.15,
+        layerHeight: 0.05,
+        coloredLayerCount: 5, // TODO: Cache color space and only recalc if necessary.
+        lithophaneDepth: 3,
+        mmHeight: "(calculated from width)",
+        mmWidth: 144,
+        useLithophane: false,
+        cyanMaterialColor: "#0092CC", // Not yet used for calculations
+        magentaMaterialColor: "#CA49A1", // Not yet used for calculations
+        yellowMaterialColor: "#EEE82F", // Not yet used for calculations
+        nthLayerDepth: (width, layerNumber) => {
+          if (layerNumber > 0)
+            return (
+              layerNumber * guiParams.layerHeight + guiParams.firstLayerHeight
+            );
+          return layerNumber * guiParams.layerHeight;
+        },
+      };
+
+      // toodo loading spinner
+      const downloadBlob = (filename, blob) => {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      };
+      const exportZip = (models) => {
+        const zip = new JSZip();
+
+        models.forEach((model) => {
+          const exporter = new THREE.STLExporter();
+          let exportScene = new THREE.Scene();
+          exportScene.add(new THREE.Mesh(model.geometry, whiteMaterial));
+          const stlData = exporter.parse(exportScene, { binary: true }); // `binary: true` might give smaller files (I haven't confirmed).
+          const blob = new Blob([stlData], {
+            type: "application/octet-stream",
+          });
+          zip.file(model.filename, blob, { base64: true });
+        });
+
+        zip.generateAsync({ type: "blob" }).then((content) => {
+          downloadBlob("stlFiles.zip", content);
+        });
+      };
+      const guiControls = {
+        exportZip: () =>
+          exportZip([
+            { filename: "black.stl", geometry: blackGeometry },
+            { filename: "white.stl", geometry: whiteGeometry },
+            { filename: "cyan.stl", geometry: cyanGeometry },
+            { filename: "magenta.stl", geometry: magentaGeometry },
+            { filename: "yellow.stl", geometry: yellowGeometry },
+          ]),
+        loadImage: () => imageInput.click(),
+      };
+
+      let blackGeometry;
+      let whiteGeometry;
+      let cyanGeometry;
+      let magentaGeometry;
+      let yellowGeometry;
+      let blackShape = new GeometryBuilder();
+      let whiteShape = new GeometryBuilder();
+      let cyanShape = new GeometryBuilder();
+      let magentaShape = new GeometryBuilder();
+      let yellowShape = new GeometryBuilder();
+
+      /////////////////////////////////////////
+      ///////////// THREE JS (SETUP) //////////
+      /////////////////////////////////////////
+      let scene = new THREE.Scene();
+      const resetScene = () => {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x333333);
+        blackGeometry = new THREE.BufferGeometry();
+        whiteGeometry = new THREE.BufferGeometry();
+        cyanGeometry = new THREE.BufferGeometry();
+        magentaGeometry = new THREE.BufferGeometry();
+        yellowGeometry = new THREE.BufferGeometry();
+      };
+      resetScene();
+
+      const camera = new THREE.PerspectiveCamera(
+        75,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+      );
+      camera.position.z = 150;
+
+      const renderer = new THREE.WebGLRenderer();
+      document.body.appendChild(renderer.domElement);
+      const warningDiv = document.createElement("div");
+      warningDiv.style.cssText =
+        "position:absolute;bottom:10px;width:100%;" +
+        "text-align:center;font-size:30px;color:#fff";
+      const warningText = document.createTextNode(
+        "Warning: preview is opaque, colors will not match printed model"
+      );
+      warningDiv.appendChild(warningText);
+      document.body.appendChild(warningDiv);
+
+      const blackMaterial = new THREE.MeshStandardMaterial({
+        color: 0x111111,
+        side: THREE.DoubleSide,
+      });
+      const whiteMaterial = new THREE.MeshStandardMaterial({
+        color: 0xD3DCDA,
+        side: THREE.DoubleSide,
+      });
+      const cyanMaterial = new THREE.MeshStandardMaterial({
+        color: guiParams.cyanMaterialColor,
+        side: THREE.DoubleSide,
+      });
+      const magentaMaterial = new THREE.MeshStandardMaterial({
+        color: guiParams.magentaMaterialColor,
+        side: THREE.DoubleSide,
+      });
+      const yellowMaterial = new THREE.MeshStandardMaterial({
+        color: guiParams.yellowMaterialColor,
+        side: THREE.DoubleSide,
+      });
+
+      const recalculateViewArea = () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+
+        renderer.setPixelRatio(window.devicePixelRatio); // TODO: IS THIS NEEDED?
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      };
+      recalculateViewArea();
+      window.addEventListener("resize", recalculateViewArea, false);
+      const controls = new THREE.OrbitControls(camera, renderer.domElement);
+      function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+      }
+      animate();
+
+      /////////////////////////////////////////
+      ///////////// GUI SETUP /////////////////
+      /////////////////////////////////////////
+      const gui = new dat.GUI();
+      gui.width = 400;
+      gui
+        .add(guiControls, "loadImage")
+        .name("Load Image (import again to recalculate)");
+      // The following paramter isn't super user-friendly, commented out for now.
+      // It also is buggy with lithophanes.
+      // gui.add(guiParams, "resolution", 0, 10).name("Resolution");
+      gui.add(guiParams, "firstLayerHeight", 0, 1).name("First Layer Height");
+      gui.add(guiParams, "layerHeight", 0, 1).name("Layer Height"); // TODO: On layer height change, recalc without re-import
+      gui.add(guiParams, "coloredLayerCount", 0, 50).name("Colored Layers");
+      gui.add(guiParams, "mmWidth", 50, 150).name("Width (mm)");
+      gui.add(guiParams, "mmHeight").name("Height (mm)").disabled = true;
+      gui.add(guiParams, "useLithophane").name("Lithophane?");
+      // TODO: Use transmissionDistance for the white filament instead of this.
+      gui.add(guiParams, "lithophaneDepth", 0, 10).name("Lith. Depth (mm)");
+
+      // Color customization from GUI does not quite work yet.
+      // gui
+      //   .addColor(guiParams, "cyanMaterialColor")
+      //   .name("Cyan")
+      //   .onChange((color) => (cyanMaterial.color = new THREE.Color(color)));
+      // gui
+      //   .addColor(guiParams, "magentaMaterialColor")
+      //   .name("Magenta")
+      //   .onChange((color) => (magentaMaterial.color = new THREE.Color(color)));
+      // gui
+      //   .addColor(guiParams, "yellowMaterialColor")
+      //   .name("Yellow")
+      //   .onChange((color) => (yellowMaterial.color = new THREE.Color(color)));
+      gui.add(guiControls, "exportZip").name("Export STL Zip");
+
+      const recomputeScene = () => {
+        blackGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(blackShape.nativeVertices(), 3)
+        );
+        blackGeometry.computeVertexNormals();
+        scene.add(new THREE.Mesh(blackGeometry, blackMaterial));
+        whiteGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(whiteShape.nativeVertices(), 3)
+        );
+        whiteGeometry.computeVertexNormals();
+        scene.add(new THREE.Mesh(whiteGeometry, whiteMaterial));
+        cyanGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(cyanShape.nativeVertices(), 3)
+        );
+        cyanGeometry.computeVertexNormals();
+        scene.add(new THREE.Mesh(cyanGeometry, cyanMaterial));
+        magentaGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(magentaShape.nativeVertices(), 3)
+        );
+        magentaGeometry.computeVertexNormals();
+        scene.add(new THREE.Mesh(magentaGeometry, magentaMaterial));
+        yellowGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(yellowShape.nativeVertices(), 3)
+        );
+        yellowGeometry.computeVertexNormals();
+        scene.add(new THREE.Mesh(yellowGeometry, yellowMaterial));
+
+        const light = new THREE.AmbientLight(0x404040);
+        scene.add(light);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+        directionalLight.position.set(1, 1, 1);
+        scene.add(directionalLight);
+      };
+
+      //////////////////////////////////////////
+      ///////////// SETUP IMAGES ///////////////
+      //////////////////////////////////////////
+      const imageParser = new ImageParser();
+
+      class Color {
+        constructor({ cyan, magenta, yellow, transmissionDistance }) {
+          this.values = new Uint8Array([cyan, magenta, yellow]);
+          this.transmissionDistance = transmissionDistance;
+        }
+
+        get id() {
+          const theResolution = 10;
+          const cyan = Math.floor(this.values[0]);
+          const magenta = Math.floor(this.values[1]);
+          const yellow = Math.floor(this.values[2]);
+          return `c${cyan}m${magenta}y${yellow}`;
+        }
+
+        get cyan() {
+          return this.values[0];
+        }
+        get magenta() {
+          return this.values[1];
+        }
+        get yellow() {
+          return this.values[2];
+        }
+
+        // Define x, y, and z so we are compatible with octree
+        get x() {
+          return this.values[0];
+        }
+        get y() {
+          return this.values[1];
+        }
+        get z() {
+          return this.values[2];
+        }
+      }
+
+      const getAverage = (a, b, transmissionDistance) => {
+        const minValue = transmissionDistance/4; // Not sure why really thin layers still blend.
+        const blendFactor = (guiParams.layerHeight+minValue) / (transmissionDistance+minValue);
+        return a * (1-blendFactor) + b * blendFactor;
+      };
+
+      const combineColors = (a, b) => {
+        const { transmissionDistance } = b;
+        return new Color({
+          cyan: getAverage(a.cyan, b.cyan, transmissionDistance),
+          magenta: getAverage(a.magenta, b.magenta, transmissionDistance),
+          yellow: getAverage(a.yellow, b.yellow, transmissionDistance),
+        });
+      };
+
+      const squaredDistance = (a, b) => {
+        const deltaX = a.x - b.x;
+        const deltaY = a.y - b.y;
+        const deltaZ = a.z - b.z;
+
+        return deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ;
+      };
+
+      const getLuminosity = (color) => {
+        // get rgb return number {}
+        return (765 - color.cyan - color.magenta - color.yellow) / 3;
+      };
+
+      export class LithographConverter {
+        pixels = [];
+
+        constructor(guiParams, imageParser, colorSpace) {
+          const { height, width } = imageParser;
+          this.colorSpace = colorSpace;
+          this.guiParams = guiParams;
+          this.width = imageParser.width;
+          this.height = imageParser.height;
+          const rawImage = imageParser.rawImage();
+
+          this.pixels = Array.from({ length: height }, () =>
+            Array(width).fill(undefined)
+          );
+
+          for (let i = 0; i < rawImage.length; i += 4) {
+            const color = new Color({
+              cyan: 255 - rawImage[i],
+              magenta: 255 - rawImage[i + 1],
+              yellow: 255 - rawImage[i + 2],
+              // alpha: rawImage[i + 3] // Not used, but still present in the data.
+            });
+            const x = (i / 4) % width;
+            const y = Math.floor(i / 4 / width);
+
+            // Perform operations with the pixel values if needed
+            this.setPixel(x, y, color);
+          }
+        }
+
+        setPixel = (x, y, color) => {
+          const closest = this.colorSpace.closestColor(color);
+          this.pixels[this.height - y - 1][x] = {
+            actualColor: color,
+            closestColor: closest.color,
+            steps: closest.steps,
+          };
+        };
+
+        getFilamentColor = (x, y) => this.pixels[y]?.[x];
+
+        addDepthPolygon = (shape, matchString, x, y, layerNumber) => {
+          const { nthLayerDepth, resolution } = this.guiParams;
+          const bottomZ = nthLayerDepth(this.width, layerNumber);
+          const topZ = nthLayerDepth(this.width, layerNumber + 1);
+
+          if (
+            this.getFilamentColor(x, y)?.steps[layerNumber - 1] !== matchString
+          ) {
+            shape.addQuadFlat(
+              { x, y },
+              { x: x + resolution, y: y + resolution },
+              bottomZ
+            );
+          }
+
+          if (
+            this.getFilamentColor(x, y)?.steps[layerNumber + 1] !== matchString
+          ) {
+            shape.addQuadFlat(
+              { x, y },
+              { x: x + resolution, y: y + resolution },
+              topZ
+            );
+          }
+
+          if (
+            this.getFilamentColor(x, y - resolution)?.steps[layerNumber] !==
+            matchString
+          ) {
+            shape.addQuadHorizontal(
+              { x, z: bottomZ },
+              { x: x + resolution, z: topZ },
+              y
+            );
+          }
+          if (
+            this.getFilamentColor(x, y + resolution)?.steps[layerNumber] !==
+            matchString
+          ) {
+            shape.addQuadHorizontal(
+              { x, z: bottomZ },
+              { x: x + resolution, z: topZ },
+              y + resolution
+            );
+          }
+          if (
+            this.getFilamentColor(x - resolution, y)?.steps[layerNumber] !==
+            matchString
+          ) {
+            shape.addQuadVertical(
+              { y, z: bottomZ },
+              { y: y + resolution, z: topZ },
+              x
+            );
+          }
+          if (
+            this.getFilamentColor(x + resolution, y)?.steps[layerNumber] !==
+            matchString
+          ) {
+            shape.addQuadVertical(
+              { y, z: bottomZ },
+              { y: y + resolution, z: topZ },
+              x + resolution
+            );
+          }
+        };
+
+        addColorsToShape = (
+          cyanShape,
+          magentaShape,
+          yellowShape,
+          whiteShape,
+          blackShape
+        ) => {
+          const { resolution } = this.guiParams;
+
+          this.pixels.forEach((col, y) => {
+            if (y % resolution !== 0) return;
+            col.forEach((_, x) => {
+              if (x % resolution !== 0) return;
+              const filamentColor = this.getFilamentColor(x, y);
+              if (!filamentColor) return;
+              filamentColor.steps.forEach((step, layerNumber) => {
+                if (step === "black") {
+                  this.addDepthPolygon(blackShape, "black", x, y, layerNumber);
+                }
+                if (step === "white") {
+                  this.addDepthPolygon(whiteShape, "white", x, y, layerNumber);
+                }
+                if (step === "cyan") {
+                  this.addDepthPolygon(cyanShape, "cyan", x, y, layerNumber);
+                }
+                if (step === "magenta") {
+                  this.addDepthPolygon(
+                    magentaShape,
+                    "magenta",
+                    x,
+                    y,
+                    layerNumber
+                  );
+                }
+                if (step === "yellow") {
+                  this.addDepthPolygon(
+                    yellowShape,
+                    "yellow",
+                    x,
+                    y,
+                    layerNumber
+                  );
+                }
+              });
+            });
+          });
+        };
+
+        // For lithophanes.
+        addLuminosityToShape = (shape) => {
+          const { resolution, nthLayerDepth } = this.guiParams;
+          const z = guiParams.nthLayerDepth(
+            this.width,
+            guiParams.coloredLayerCount+1
+          );
+          const getZ = (pixel) => {
+            const pixelColor = pixel.actualColor;
+            const factor = this.guiParams.lithophaneDepth;
+            // Adding one extra `layerHeight` will ensure a min. layer height.
+            const offset = guiParams.layerHeight + z;
+            return ((255 - getLuminosity(pixelColor)) / 255) * factor + offset;
+          };
+
+          for (let y = 0; y < this.height - resolution; y++) {
+            for (let x = 0; x < this.width - resolution; x++) {
+              if (x % resolution !== 0) continue;
+              if (y % resolution !== 0) continue;
+              const pixel = this.pixels[y][x];
+              const right = this.pixels[y][x + resolution];
+              const down = this.pixels[y + resolution][x];
+              const diagonal = this.pixels[y + resolution][x + resolution];
+
+              // Bottom most layer
+              shape.addQuad(
+                { x, y, z },
+                { x: x + resolution, y, z },
+                { x, y: y + resolution, z },
+                { x: x + resolution, y: y + resolution, z }
+              );
+              shape.addQuad(
+                { x, y, z: getZ(pixel) },
+                { x: x + resolution, y, z: getZ(right) },
+                { x, y: y + resolution, z: getZ(down) },
+                { x: x + resolution, y: y + resolution, z: getZ(diagonal) }
+              );
+              if (y === 0) {
+                shape.addQuad(
+                  { x, y, z },
+                  { x: x + resolution, y, z },
+                  { x, y, z: getZ(pixel) },
+                  { x: x + resolution, y, z: getZ(right) }
+                );
+              }
+              if (x === 0) {
+                shape.addQuad(
+                  { x, y, z },
+                  { x, y: y + resolution, z },
+                  { x, y, z: getZ(pixel) },
+                  { x, y: y + resolution, z: getZ(down) }
+                );
+              }
+              if (y === this.height - resolution - 1) {
+                shape.addQuad(
+                  { x, y: y + resolution, z },
+                  { x: x + resolution, y: y + resolution, z },
+                  { x, y: y + resolution, z: getZ(down) },
+                  { x: x + resolution, y: y + resolution, z: getZ(diagonal) }
+                );
+              }
+              if (x === this.width - resolution - 1) {
+                shape.addQuad(
+                  { x: x + resolution, y, z },
+                  { x: x + resolution, y: y + resolution, z },
+                  { x: x + resolution, y, z: getZ(right) },
+                  { x: x + resolution, y: y + resolution, z: getZ(diagonal) }
+                );
+              }
+            }
+          }
+        };
+
+        saveToShapes = (
+          cyanShape,
+          magentaShape,
+          yellowShape,
+          whiteShape,
+          blackShape
+        ) => {
+          this.addColorsToShape(
+            cyanShape,
+            magentaShape,
+            yellowShape,
+            whiteShape,
+            blackShape
+          );
+          if (guiParams.useLithophane) {
+            this.addLuminosityToShape(whiteShape);
+          }
+
+          blackShape.translateX(-(this.height / 2));
+          blackShape.translateY(-(this.width / 2));
+          whiteShape.translateX(-(this.height / 2));
+          whiteShape.translateY(-(this.width / 2));
+          cyanShape.translateX(-(this.height / 2));
+          cyanShape.translateY(-(this.width / 2));
+          magentaShape.translateX(-(this.height / 2));
+          magentaShape.translateY(-(this.width / 2));
+          yellowShape.translateX(-(this.height / 2));
+          yellowShape.translateY(-(this.width / 2));
+        };
+      }
+
+      // Using this octree may be slower than iterating over every pixel.
+      // Not 100% sure why.
+      class OctreeNode {
+        constructor(x = 0, y = 0, z = 0, size = 255, depth = 0) {
+          this.x = x;
+          this.y = y;
+          this.z = z;
+          this.size = size;
+
+          this.points = [];
+          this.divided = false;
+          this.depth = depth;
+          this.maxPoints = 1000;
+          this.children = [];
+        }
+
+        #subdivide() {
+          if (this.divided) throw new Error("Already subdivided!");
+
+          this.divided = true;
+          const s = this.size / 2;
+
+          this.children.push(new OctreeNode(this.x, this.y, this.z, s));
+          this.children.push(new OctreeNode(this.x + s, this.y, this.z, s));
+          this.children.push(new OctreeNode(this.x, this.y + s, this.z, s));
+          this.children.push(new OctreeNode(this.x, this.y, this.z + s, s));
+          this.children.push(new OctreeNode(this.x + s, this.y + s, this.z, s));
+          this.children.push(new OctreeNode(this.x, this.y + s, this.z + s, s));
+          this.children.push(new OctreeNode(this.x + s, this.y, this.z + s, s));
+          this.children.push(
+            new OctreeNode(this.x + s, this.y + s, this.z + s, s)
+          );
+
+          for (let layer of this.points) {
+            for (let child of this.children) {
+              if (child.insert(layer)) {
+                break;
+              }
+            }
+          }
+          this.points.length = 0;
+        }
+
+        insert(point) {
+          if (!this.isPointWithin(point)) {
+            return false;
+          }
+
+          if (this.points.length < this.maxPoints && !this.divided) {
+            this.points.push(point);
+            return true;
+          } else {
+            if (!this.divided) {
+              this.#subdivide();
+            }
+            for (let child of this.children) {
+              if (child.insert(point)) {
+                return true;
+              }
+            }
+          }
+          return false;
+        }
+
+        isPointWithin(point) {
+          if (point.x < this.x) return false;
+          if (point.x > this.x + this.size) return false;
+          if (point.y < this.y) return false;
+          if (point.y > this.y + this.size) return false;
+          if (point.z < this.z) return false;
+          if (point.z > this.z + this.size) return false;
+
+          return true;
+        }
+
+        clampPointToNode = (point) => ({
+          x: Math.max(this.x, Math.min(point.x, this.x + this.size)),
+          y: Math.max(this.y, Math.min(point.y, this.y + this.size)),
+          z: Math.max(this.z, Math.min(point.z, this.z + this.size)),
+        });
+
+        intersectsSphere(center, radius) {
+          const closestPoint = this.clampPointToNode(center);
+          return squaredDistance(center, closestPoint) <= radius * radius;
+        }
+
+        closestPoint(queryPoint, radius = Infinity) {
+          if (!this.intersectsSphere(queryPoint, radius)) {
+            return null;
+          }
+
+          let closestDist = radius;
+          let closestPoint = null;
+
+          for (const point of this.points) {
+            const dist = squaredDistance(point, queryPoint);
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestPoint = point;
+            }
+          }
+
+          if (this.divided) {
+            let prioritizedChild = null;
+            for (let child of this.children) {
+              if (child.isPointWithin(queryPoint)) {
+                prioritizedChild = child;
+                const childClosest = prioritizedChild.closestPoint(
+                  queryPoint,
+                  closestDist
+                );
+                if (childClosest) {
+                  const dist = squaredDistance(childClosest, queryPoint);
+                  if (dist < closestDist) {
+                    closestDist = dist;
+                    closestPoint = childClosest;
+                  }
+                }
+                break;
+              }
+            }
+            for (let child of this.children) {
+              const childClosest = child.closestPoint(queryPoint, closestDist);
+              if (childClosest) {
+                const dist = squaredDistance(childClosest, queryPoint);
+                if (dist < closestDist) {
+                  closestDist = dist;
+                  closestPoint = childClosest;
+                }
+              }
+            }
+          }
+
+          return closestPoint;
+        }
+      }
+
+      class ColorSpace {
+        constructor(paletteLayers, filaments) {
+          this.filaments = filaments;
+          this.colorSpace = {};
+          this.octree = new OctreeNode();
+          paletteLayers.forEach((layer) => {
+            this.octree.insert(layer.color);
+            this.insert(layer.color, layer.steps);
+          });
+        }
+
+        insert(color, steps) {
+          this.colorSpace[color.id] = steps;
+        }
+
+        closestColor(queryColor) {
+          const color = this.octree.closestPoint(queryColor);
+          return {
+            color,
+            steps: this.colorSpace[color.id],
+          };
+        }
+      }
+
+      const calculateColorSpace = (filaments) => {
+        let paletteLayers = [
+          {
+            color: new Color({ cyan: 255, magenta: 255, yellow: 255 }),
+            steps: ["black"],
+          },
+        ];
+        if (guiParams.useLithophane) {
+          paletteLayers = [
+            {
+              color: new Color({ cyan: 0, magenta: 0, yellow: 0 }),
+              steps: ["white"],
+            },
+          ];
+        }
+        let previousPaletteLayers = [...paletteLayers];
+        for (let i = 0; i < guiParams.coloredLayerCount; i++) {
+          const newPaletteLayers = [];
+
+          previousPaletteLayers.forEach((paletteLayer) => {
+            filaments.forEach((filament) => {
+              newPaletteLayers.push({
+                color: combineColors(paletteLayer.color, filament.color),
+                steps: [...paletteLayer.steps, ...filament.steps],
+              });
+            });
+          });
+          if (guiParams.useLithophane) {
+            // Lithophanes need even thickness
+            paletteLayers = [...newPaletteLayers];
+          } else {
+            paletteLayers = [...paletteLayers, ...newPaletteLayers];
+          }
+          previousPaletteLayers = newPaletteLayers;
+        }
+
+        return new ColorSpace(paletteLayers, filaments);
+      };
+
+      function iteratePixels(width, height) {
+        // These are based of the bambu lithophane bundle.
+        // some values might not be accurate.
+        const filaments = [
+          {
+            color: new Color({
+              cyan: 0,
+              magenta: 0,
+              yellow: 0,
+              lithophaneTransmissionDistance: 3, // NOTE: I have not measured this one.
+              transmissionDistance: 1,
+            }),
+            steps: ["white"],
+          },
+          {
+            color: new Color({
+              cyan: 255,
+              magenta: 109,
+              yellow: 51,
+              lithophaneTransmissionDistance: 1.25,
+              transmissionDistance: 0.4,
+            }),
+            steps: ["cyan"],
+          },
+          {
+            color: new Color({
+              cyan: 53,
+              magenta: 182,
+              yellow: 94,
+              lithophaneTransmissionDistance: 1.8,
+              transmissionDistance: 0.6,
+            }),
+            steps: ["magenta"],
+          },
+          {
+            color: new Color({
+              cyan: 17,
+              magenta: 23,
+              yellow: 208,
+              lithophaneTransmissionDistance: 5,
+              transmissionDistance: 1,
+            }),
+            steps: ["yellow"],
+          },
+        ];
+        const colorSpace = calculateColorSpace(filaments);
+        const converter = new LithographConverter(
+          guiParams,
+          imageParser,
+          colorSpace
+        );
+        const scale = guiParams.mmWidth / imageParser.width;
+        blackShape = new GeometryBuilder(scale);
+        whiteShape = new GeometryBuilder(scale);
+        cyanShape = new GeometryBuilder(scale);
+        magentaShape = new GeometryBuilder(scale);
+        yellowShape = new GeometryBuilder(scale);
+        converter.saveToShapes(
+          cyanShape,
+          magentaShape,
+          yellowShape,
+          whiteShape,
+          blackShape
+        );
+        recomputeScene();
+      }
+      const imageLoadedCallback = () => {
+        resetScene();
+        iteratePixels();
+      };
+      imageInput.addEventListener(
+        "change",
+        (e) => {
+          imageParser.handleImage(e, imageLoadedCallback);
+        },
+        false
+      );
+    </script>
+  </body>
+</html>
