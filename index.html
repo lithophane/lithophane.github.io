@@ -138,7 +138,7 @@
         firstLayerHeight: 0.15,
         layerHeight: 0.05,
         coloredLayerCount: 5, // TODO: Cache color space and only recalc if necessary.
-        lithophaneDepth: 3,
+        lithophaneDepth: 1.5,
         mmHeight: "(calculated from width)",
         mmWidth: 144,
         useLithophane: false,
@@ -276,7 +276,7 @@
       // gui.add(guiParams, "resolution", 0, 10).name("Resolution");
       gui.add(guiParams, "firstLayerHeight", 0, 1).name("First Layer Height");
       gui.add(guiParams, "layerHeight", 0, 1).name("Layer Height"); // TODO: On layer height change, recalc without re-import
-      gui.add(guiParams, "coloredLayerCount", 0, 50).name("Colored Layers");
+      gui.add(guiParams, "coloredLayerCount", 0, 8).name("Colored Layers");
       gui.add(guiParams, "mmWidth", 50, 150).name("Width (mm)");
       gui.add(guiParams, "mmHeight").name("Height (mm)").disabled = true;
       gui.add(guiParams, "useLithophane").name("Lithophane?");
