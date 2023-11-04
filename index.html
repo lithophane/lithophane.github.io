@@ -235,29 +235,13 @@
         "position:absolute;bottom:10px;width:100%;" +
         "text-align:center;font-size:30px;color:#fff";
       const warningText = document.createTextNode(
-        "Warning: preview is opaque, colors will not match printed model"
+        "Note: Preview is flat texture, does not yet show depth."
       );
       warningDiv.appendChild(warningText);
       document.body.appendChild(warningDiv);
 
-      const blackMaterial = new THREE.MeshStandardMaterial({
-        color: 0x111111,
-        side: THREE.DoubleSide,
-      });
       const whiteMaterial = new THREE.MeshStandardMaterial({
-        color: 0xD3DCDA,
-        side: THREE.DoubleSide,
-      });
-      const cyanMaterial = new THREE.MeshStandardMaterial({
-        color: guiParams.cyanMaterialColor,
-        side: THREE.DoubleSide,
-      });
-      const magentaMaterial = new THREE.MeshStandardMaterial({
-        color: guiParams.magentaMaterialColor,
-        side: THREE.DoubleSide,
-      });
-      const yellowMaterial = new THREE.MeshStandardMaterial({
-        color: guiParams.yellowMaterialColor,
+        color: 0xd3dcda,
         side: THREE.DoubleSide,
       });
 
@@ -314,38 +298,32 @@
       //   .onChange((color) => (yellowMaterial.color = new THREE.Color(color)));
       gui.add(guiControls, "exportZip").name("Export STL Zip");
 
-      const recomputeScene = () => {
-        blackGeometry.setAttribute(
-          "position",
-          new THREE.BufferAttribute(blackShape.nativeVertices(), 3)
-        );
-        blackGeometry.computeVertexNormals();
-        scene.add(new THREE.Mesh(blackGeometry, blackMaterial));
-        whiteGeometry.setAttribute(
-          "position",
-          new THREE.BufferAttribute(whiteShape.nativeVertices(), 3)
-        );
-        whiteGeometry.computeVertexNormals();
-        scene.add(new THREE.Mesh(whiteGeometry, whiteMaterial));
-        cyanGeometry.setAttribute(
-          "position",
-          new THREE.BufferAttribute(cyanShape.nativeVertices(), 3)
-        );
-        cyanGeometry.computeVertexNormals();
-        scene.add(new THREE.Mesh(cyanGeometry, cyanMaterial));
-        magentaGeometry.setAttribute(
-          "position",
-          new THREE.BufferAttribute(magentaShape.nativeVertices(), 3)
-        );
-        magentaGeometry.computeVertexNormals();
-        scene.add(new THREE.Mesh(magentaGeometry, magentaMaterial));
-        yellowGeometry.setAttribute(
-          "position",
-          new THREE.BufferAttribute(yellowShape.nativeVertices(), 3)
-        );
-        yellowGeometry.computeVertexNormals();
-        scene.add(new THREE.Mesh(yellowGeometry, yellowMaterial));
+      const recomputeScene = (pixels, width, height) => {
+        const printPreviewTexture = new Uint8Array(width * height * 3);
 
+        pixels.forEach(({ closestColor: color }, index) => {
+          const r = 255 - color.cyan;
+          const g = 255 - color.magenta;
+          const b = 255 - color.yellow;
+          const idx = index * 3;
+          printPreviewTexture[idx] = r;
+          printPreviewTexture[idx + 1] = g;
+          printPreviewTexture[idx + 2] = b;
+        });
+
+        const mmHeight = height * (guiParams.mmWidth / width); // TODO: DRY up scale var
+        const texture = new THREE.DataTexture(
+          printPreviewTexture,
+          width,
+          height,
+          THREE.RGBFormat
+        );
+        texture.needsUpdate = true;
+        const printPreviewMesh = new THREE.Mesh(
+          new THREE.PlaneGeometry(guiParams.mmWidth, mmHeight),
+          new THREE.MeshBasicMaterial({ map: texture })
+        );
+        scene.add(printPreviewMesh);
         const light = new THREE.AmbientLight(0x404040);
         scene.add(light);
         const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
@@ -395,9 +373,11 @@
       }
 
       const getAverage = (a, b, transmissionDistance) => {
-        const minValue = transmissionDistance/4; // Not sure why really thin layers still blend.
-        const blendFactor = (guiParams.layerHeight+minValue) / (transmissionDistance+minValue);
-        return a * (1-blendFactor) + b * blendFactor;
+        const minValue = transmissionDistance / 4; // Not sure why really thin layers still blend.
+        const blendFactor =
+          (guiParams.layerHeight + minValue) /
+          (transmissionDistance + minValue);
+        return a * (1 - blendFactor) + b * blendFactor;
       };
 
       const combineColors = (a, b) => {
@@ -583,7 +563,7 @@
           const { resolution, nthLayerDepth } = this.guiParams;
           const z = guiParams.nthLayerDepth(
             this.width,
-            guiParams.coloredLayerCount+1
+            guiParams.coloredLayerCount + 1
           );
           const getZ = (pixel) => {
             const pixelColor = pixel.actualColor;
@@ -946,7 +926,11 @@
           whiteShape,
           blackShape
         );
-        recomputeScene();
+        recomputeScene(
+          converter.pixels.flat(),
+          imageParser.width,
+          imageParser.height
+        );
       }
       const imageLoadedCallback = () => {
         resetScene();
